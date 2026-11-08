@@ -17697,3 +17697,312 @@ func TestFileStoreLogBackedFollowsWriteMode(t *testing.T) {
 		})
 	})
 }
+
+func verifyJetStreamMetaRecovery(dir, streamName string) error {
+	metafile := filepath.Join(dir, JetStreamMetaFile)
+	metasum := filepath.Join(dir, JetStreamMetaFileSum)
+
+	if _, err := os.Stat(metafile); os.IsNotExist(err) {
+		return fmt.Errorf("missing metafile %q", metafile)
+	}
+	buf, err := os.ReadFile(metafile)
+	if err != nil {
+		return fmt.Errorf("error reading metafile %q: %v", metafile, err)
+	}
+	if _, err := os.Stat(metasum); os.IsNotExist(err) {
+		return fmt.Errorf("missing checksum file %q", metasum)
+	}
+	sum, err := os.ReadFile(metasum)
+	if err != nil {
+		return fmt.Errorf("error reading checksum %q: %v", metasum, err)
+	}
+	key := sha256.Sum256([]byte(streamName))
+	hh, err := highwayhash.NewDigest64(key[:])
+	if err != nil {
+		return err
+	}
+	hh.Write(buf)
+	var hb [highwayhash.Size64]byte
+	checksum := hex.EncodeToString(hh.Sum(hb[:0]))
+	if checksum != string(sum) {
+		return fmt.Errorf("checksum mismatch: expected %q, got %q", checksum, string(sum))
+	}
+	return nil
+}
+
+func verifyJetStreamConsumerMetaRecovery(streamDir, streamName, consumerName string) error {
+	cdir := filepath.Join(streamDir, consumerDir, consumerName)
+	metafile := filepath.Join(cdir, JetStreamMetaFile)
+	metasum := filepath.Join(cdir, JetStreamMetaFileSum)
+
+	if _, err := os.Stat(metafile); os.IsNotExist(err) {
+		return fmt.Errorf("missing consumer metafile %q", metafile)
+	}
+	buf, err := os.ReadFile(metafile)
+	if err != nil {
+		return fmt.Errorf("error reading consumer metafile %q: %v", metafile, err)
+	}
+	if _, err := os.Stat(metasum); os.IsNotExist(err) {
+		return fmt.Errorf("missing consumer checksum file %q", metasum)
+	}
+	sum, err := os.ReadFile(metasum)
+	if err != nil {
+		return fmt.Errorf("error reading consumer checksum %q: %v", metasum, err)
+	}
+	key := sha256.Sum256([]byte(streamName + "/" + consumerName))
+	hh, err := highwayhash.NewDigest64(key[:])
+	if err != nil {
+		return err
+	}
+	hh.Write(buf)
+	var hb [highwayhash.Size64]byte
+	checksum := hex.EncodeToString(hh.Sum(hb[:0]))
+	if checksum != string(sum) {
+		return fmt.Errorf("consumer checksum mismatch: expected %q, got %q", checksum, string(sum))
+	}
+	return nil
+}
+
+func TestFileStoreMetaChecksumRecovery(t *testing.T) {
+	// Scenario 1: meta.inf exists, meta.sum is missing
+	t.Run("MetaInfExistsMetaSumMissing", func(t *testing.T) {
+		storeDir := t.TempDir()
+		fcfg := FileStoreConfig{StoreDir: storeDir}
+		mconfig := StreamConfig{Name: "TEST_STREAM", Storage: FileStorage, Subjects: []string{"foo"}}
+
+		fs, err := newFileStore(fcfg, mconfig)
+		require_NoError(t, err)
+		fs.Stop()
+
+		metasum := filepath.Join(storeDir, JetStreamMetaFileSum)
+		require_NoError(t, os.Remove(metasum))
+
+		// Stream recreation
+		fs, err = newFileStore(fcfg, mconfig)
+		require_NoError(t, err)
+		defer fs.Stop()
+
+		// Verify meta.sum was regenerated and valid for JetStream recovery
+		if err := verifyJetStreamMetaRecovery(storeDir, mconfig.Name); err != nil {
+			t.Fatalf("JetStream recovery check failed after recreation: %v", err)
+		}
+	})
+
+	// Scenario 2: meta.sum exists but is empty
+	t.Run("MetaSumEmpty", func(t *testing.T) {
+		storeDir := t.TempDir()
+		fcfg := FileStoreConfig{StoreDir: storeDir}
+		mconfig := StreamConfig{Name: "TEST_STREAM", Storage: FileStorage, Subjects: []string{"foo"}}
+
+		fs, err := newFileStore(fcfg, mconfig)
+		require_NoError(t, err)
+		fs.Stop()
+
+		metasum := filepath.Join(storeDir, JetStreamMetaFileSum)
+		require_NoError(t, os.WriteFile(metasum, nil, defaultFilePerms))
+
+		// Stream recreation
+		fs, err = newFileStore(fcfg, mconfig)
+		require_NoError(t, err)
+		defer fs.Stop()
+
+		if err := verifyJetStreamMetaRecovery(storeDir, mconfig.Name); err != nil {
+			t.Fatalf("JetStream recovery check failed after recreation: %v", err)
+		}
+	})
+
+	// Scenario 3: meta.inf is missing
+	t.Run("MetaInfMissing", func(t *testing.T) {
+		storeDir := t.TempDir()
+		fcfg := FileStoreConfig{StoreDir: storeDir}
+		mconfig := StreamConfig{Name: "TEST_STREAM", Storage: FileStorage, Subjects: []string{"foo"}}
+
+		fs, err := newFileStore(fcfg, mconfig)
+		require_NoError(t, err)
+		fs.Stop()
+
+		metafile := filepath.Join(storeDir, JetStreamMetaFile)
+		metasum := filepath.Join(storeDir, JetStreamMetaFileSum)
+		require_NoError(t, os.Remove(metafile))
+		require_NoError(t, os.Remove(metasum))
+
+		// Stream recreation
+		fs, err = newFileStore(fcfg, mconfig)
+		require_NoError(t, err)
+		defer fs.Stop()
+
+		if err := verifyJetStreamMetaRecovery(storeDir, mconfig.Name); err != nil {
+			t.Fatalf("JetStream recovery check failed after recreation: %v", err)
+		}
+	})
+
+	// Scenario 4: Both metadata files are valid
+	t.Run("BothValid", func(t *testing.T) {
+		storeDir := t.TempDir()
+		fcfg := FileStoreConfig{StoreDir: storeDir}
+		mconfig := StreamConfig{Name: "TEST_STREAM", Storage: FileStorage, Subjects: []string{"foo"}}
+
+		fs, err := newFileStore(fcfg, mconfig)
+		require_NoError(t, err)
+		fs.Stop()
+
+		if err := verifyJetStreamMetaRecovery(storeDir, mconfig.Name); err != nil {
+			t.Fatalf("Expected valid recovery: %v", err)
+		}
+
+		// Re-opening existing valid stream
+		fs, err = newFileStore(fcfg, mconfig)
+		require_NoError(t, err)
+		defer fs.Stop()
+
+		if err := verifyJetStreamMetaRecovery(storeDir, mconfig.Name); err != nil {
+			t.Fatalf("Expected valid recovery after re-opening: %v", err)
+		}
+	})
+
+	// Scenario 5 & 6: The reported 2-restart bug reproduction
+	// Crash between meta writes -> Restart 1 skips stream -> Recreate stream -> Publish msgs -> Restart 2 must NOT lose msgs!
+	t.Run("ReportedTwoRestartBugAcknowledgedMessagesSurvive", func(t *testing.T) {
+		storeDir := t.TempDir()
+		fcfg := FileStoreConfig{StoreDir: storeDir}
+		mconfig := StreamConfig{Name: "EVENTS", Storage: FileStorage, Subjects: []string{"events.>"}}
+
+		// Initial creation
+		fs, err := newFileStore(fcfg, mconfig)
+		require_NoError(t, err)
+
+		// Initial messages
+		for i := 1; i <= 10; i++ {
+			_, _, err = fs.StoreMsg("events.1", nil, []byte(fmt.Sprintf("initial-msg-%d", i)), 0)
+			require_NoError(t, err)
+		}
+		fs.Stop()
+
+		// Simulate crash between atomic write of meta.inf and meta.sum
+		metasum := filepath.Join(storeDir, JetStreamMetaFileSum)
+		require_NoError(t, os.Remove(metasum))
+
+		// First restart: server checks metadata recovery
+		recoveryErr := verifyJetStreamMetaRecovery(storeDir, mconfig.Name)
+		if recoveryErr == nil {
+			t.Fatalf("Expected recovery to fail on missing meta.sum")
+		}
+
+		// Client recreates the stream
+		fs2, err := newFileStore(fcfg, mconfig)
+		require_NoError(t, err)
+
+		// Client publishes and gets ACKs for 20 more messages
+		for i := 11; i <= 30; i++ {
+			_, _, err = fs2.StoreMsg("events.1", nil, []byte(fmt.Sprintf("acked-msg-%d", i)), 0)
+			require_NoError(t, err)
+		}
+		fs2.Stop()
+
+		// Second restart: metadata must be valid for JetStream recovery!
+		if err := verifyJetStreamMetaRecovery(storeDir, mconfig.Name); err != nil {
+			t.Fatalf("Second restart failed to validate stream metadata: %v", err)
+		}
+
+		// Recover stream
+		fs3, err := newFileStoreWithCreatedAndMode(fcfg, mconfig, time.Now().UTC(), nil, nil, true)
+		require_NoError(t, err)
+		defer fs3.Stop()
+
+		state := fs3.State()
+		if state.Msgs != 30 {
+			t.Fatalf("Expected all 30 acknowledged messages to survive, found %d", state.Msgs)
+		}
+	})
+
+	// Scenario 7: Consumer metadata recovery (missing meta.sum and empty meta.sum, state preserved)
+	t.Run("ConsumerMetaChecksumRecovery", func(t *testing.T) {
+		storeDir := t.TempDir()
+		fcfg := FileStoreConfig{StoreDir: storeDir}
+		mconfig := StreamConfig{Name: "TEST_STREAM", Storage: FileStorage, Subjects: []string{"foo"}}
+
+		fs, err := newFileStore(fcfg, mconfig)
+		require_NoError(t, err)
+
+		oconfig := ConsumerConfig{
+			Durable:        "C1",
+			DeliverSubject: "d",
+			FilterSubject:  "foo",
+			AckPolicy:      AckExplicit,
+		}
+		obs, err := fs.ConsumerStore("C1", time.Time{}, &oconfig)
+		require_NoError(t, err)
+
+		// Set some state on consumer
+		cstate := &ConsumerState{
+			Delivered: SequencePair{Stream: 15, Consumer: 5},
+			AckFloor:  SequencePair{Stream: 10, Consumer: 3},
+		}
+		require_NoError(t, obs.Update(cstate))
+		fs.Stop()
+
+		// Simulate crash between consumer meta.inf and meta.sum
+		ometasum := filepath.Join(storeDir, consumerDir, "C1", JetStreamMetaFileSum)
+		require_NoError(t, os.Remove(ometasum))
+
+		// Recovery check must fail before recreation
+		if err := verifyJetStreamConsumerMetaRecovery(storeDir, mconfig.Name, "C1"); err == nil {
+			t.Fatalf("Expected consumer recovery check to fail on missing meta.sum")
+		}
+
+		// Reopen stream and recreate/re-open consumer
+		fs2, err := newFileStore(fcfg, mconfig)
+		require_NoError(t, err)
+		obs2, err := fs2.ConsumerStore("C1", time.Time{}, &oconfig)
+		require_NoError(t, err)
+		defer fs2.Stop()
+
+		// Consumer checksum must now be valid for recovery
+		if err := verifyJetStreamConsumerMetaRecovery(storeDir, mconfig.Name, "C1"); err != nil {
+			t.Fatalf("Consumer recovery check failed after recreation: %v", err)
+		}
+
+		// Consumer state must be preserved
+		curState, err := obs2.State()
+		require_NoError(t, err)
+		if curState.Delivered.Stream != 15 || curState.AckFloor.Stream != 10 {
+			t.Fatalf("Consumer state was lost or corrupted: got %+v", curState)
+		}
+
+		// Also test empty consumer meta.sum
+		fs2.Stop()
+		require_NoError(t, os.WriteFile(ometasum, nil, defaultFilePerms))
+
+		fs3, err := newFileStore(fcfg, mconfig)
+		require_NoError(t, err)
+		obs3, err := fs3.ConsumerStore("C1", time.Time{}, &oconfig)
+		require_NoError(t, err)
+		defer fs3.Stop()
+
+		if err := verifyJetStreamConsumerMetaRecovery(storeDir, mconfig.Name, "C1"); err != nil {
+			t.Fatalf("Consumer recovery check failed after empty meta.sum recreation: %v", err)
+		}
+		curState3, err := obs3.State()
+		require_NoError(t, err)
+		if curState3.Delivered.Stream != 15 || curState3.AckFloor.Stream != 10 {
+			t.Fatalf("Consumer state was lost or corrupted on empty meta.sum: got %+v", curState3)
+		}
+	})
+
+	// Scenario 8: Corrupted metadata must not silently become accepted
+	t.Run("CorruptedMetadataNotSilentlyAccepted", func(t *testing.T) {
+		storeDir := t.TempDir()
+		metafile := filepath.Join(storeDir, JetStreamMetaFile)
+		metasum := filepath.Join(storeDir, JetStreamMetaFileSum)
+		require_NoError(t, os.MkdirAll(storeDir, defaultDirPerms))
+
+		// Write corrupt/garbage data
+		require_NoError(t, os.WriteFile(metafile, []byte("NOT_VALID_JSON_OR_CIPHER"), defaultFilePerms))
+		require_NoError(t, os.WriteFile(metasum, []byte("INVALID_CHECKSUM"), defaultFilePerms))
+
+		// Normal JetStream recovery must fail
+		if err := verifyJetStreamMetaRecovery(storeDir, "TEST_STREAM"); err == nil {
+			t.Fatalf("Expected JetStream recovery to reject corrupted metadata")
+		}
+	})
+}

@@ -636,10 +636,41 @@ func newFileStoreWithCreatedAndMode(fcfg FileStoreConfig, cfg StreamConfig, crea
 		}
 	}
 
-	// Write our meta data if it does not exist or is zero'd out.
+	// Write our meta data if it does not exist, is zero'd out, or missing checksum.
 	meta := filepath.Join(fcfg.StoreDir, JetStreamMetaFile)
+	sum := filepath.Join(fcfg.StoreDir, JetStreamMetaFileSum)
 	fi, err := os.Stat(meta)
-	if err != nil && os.IsNotExist(err) || fi != nil && fi.Size() == 0 {
+	if err != nil && !os.IsNotExist(err) {
+		return nil, err
+	}
+	sfi, sumErr := os.Stat(sum)
+	if sumErr != nil && !os.IsNotExist(sumErr) {
+		return nil, sumErr
+	}
+
+	var rewriteMeta bool
+	if os.IsNotExist(err) || (fi != nil && fi.Size() == 0) ||
+		os.IsNotExist(sumErr) || (sfi != nil && sfi.Size() == 0) {
+		rewriteMeta = true
+	} else if !recovering {
+		// If we are not recovering (e.g. client re-adding an unrecovered stream),
+		// verify the checksum matches. If it doesn't match (torn write / corrupted checksum),
+		// rewrite the metadata so it will survive future restarts.
+		buf, rerr := os.ReadFile(meta)
+		sumBuf, serr := os.ReadFile(sum)
+		if rerr == nil && serr == nil {
+			fs.hh.Reset()
+			fs.hh.Write(buf)
+			var hb [highwayhash.Size64]byte
+			if hex.EncodeToString(fs.hh.Sum(hb[:0])) != string(sumBuf) {
+				rewriteMeta = true
+			}
+		} else {
+			rewriteMeta = true
+		}
+	}
+
+	if rewriteMeta {
 		if err := fs.writeStreamMeta(); err != nil {
 			return nil, err
 		}
@@ -13641,12 +13672,26 @@ func (fs *fileStore) ConsumerStore(name string, created time.Time, cfg *Consumer
 	// Track if we are creating the directory so that we can clean up if we encounter an error.
 	var didCreate bool
 
-	// Write our meta data iff does not exist.
+	// Write our meta data if it does not exist, is zero'd out, or missing checksum.
 	meta := filepath.Join(odir, JetStreamMetaFile)
-	if _, err := os.Stat(meta); err != nil && os.IsNotExist(err) {
+	sum := filepath.Join(odir, JetStreamMetaFileSum)
+	fi, err := os.Stat(meta)
+	if err != nil && !os.IsNotExist(err) {
+		return nil, err
+	}
+	if os.IsNotExist(err) {
 		didCreate = true
+	}
+	sfi, sumErr := os.Stat(sum)
+	if sumErr != nil && !os.IsNotExist(sumErr) {
+		return nil, sumErr
+	}
+
+	if didCreate || (fi != nil && fi.Size() == 0) || os.IsNotExist(sumErr) || (sfi != nil && sfi.Size() == 0) {
 		if err := o.writeConsumerMeta(); err != nil {
-			_ = os.RemoveAll(odir)
+			if didCreate {
+				_ = os.RemoveAll(odir)
+			}
 			return nil, err
 		}
 	}
